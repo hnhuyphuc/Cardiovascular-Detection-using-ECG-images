@@ -319,8 +319,17 @@ class ECG:
             logits = self.transformer_model(x)
             pred_idx = int(torch.argmax(logits, dim=1).cpu().item())
 
-        # nếu checkpoint có class_names thì dùng luôn
-        if self.transformer_class_names is not None and pred_idx < len(self.transformer_class_names):
-            return f"Prediction: {self.transformer_class_names[pred_idx]}"
+        label_map = {
+            "N": "Nhịp bình thường",
+            "S": "Ngoại tâm thu trên thất",
+            "V": "Ngoại tâm thu thất",
+            "F": "Nhịp lai",
+            "Q": "Nhịp không xác định",
+        }
 
-        return f"Prediction class: {pred_idx}"
+        if self.transformer_class_names is not None and pred_idx < len(self.transformer_class_names):
+            class_code = self.transformer_class_names[pred_idx]
+            return f"Kết quả dự đoán: {class_code} - {label_map.get(class_code, class_code)}"
+
+        return f"Prediction: {pred_idx}"
+    
