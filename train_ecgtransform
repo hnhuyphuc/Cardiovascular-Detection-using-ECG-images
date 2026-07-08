@@ -9,11 +9,11 @@ import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report, confusion_matrix, f1_score
+from sklearn.metrics import classification_report, confusion_matrix, f1_score, accuracy_score
 
 from models import ecgTransForm
+import shutil
 from datetime import datetime
-
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -29,10 +29,10 @@ SAVE_PATH = BASE_DIR / "Deployment" / "checkpoint_best_4class.pt"
 
 BATCH_SIZE = 32
 NUM_EPOCHS_STAGE1 = 10
-NUM_EPOCHS_STAGE2 = 50
+NUM_EPOCHS_STAGE2 = 70
 LR_STAGE1 = 1e-3
-LR_STAGE2 = 1e-3
-WEIGHT_DECAY = 1e-4
+LR_STAGE2 = 3e-3
+WEIGHT_DECAY = 5e-4
 RANDOM_SEED = 42
 X_SIGNAL_LENGTH = 3060  # khớp pipeline cũ: 12 leads x 255 points
 
@@ -197,8 +197,9 @@ def train_one_epoch(model, loader, optimizer, criterion, device):
         all_labels.extend(y.detach().cpu().numpy().tolist())
 
     avg_loss = total_loss / max(total_count, 1)
+    acc = accuracy_score(all_labels, all_preds)
     macro_f1 = f1_score(all_labels, all_preds, average="macro")
-    return avg_loss, macro_f1
+    return avg_loss, acc, macro_f1
 
 
 @torch.no_grad()
@@ -225,26 +226,49 @@ def evaluate(model, loader, criterion, device):
         all_labels.extend(y.detach().cpu().numpy().tolist())
 
     avg_loss = total_loss / max(total_count, 1)
+    acc = accuracy_score(all_labels, all_preds)
     macro_f1 = f1_score(all_labels, all_preds, average="macro")
 
-    return avg_loss, macro_f1, np.array(all_labels), np.array(all_preds)
+    return avg_loss, acc, macro_f1, np.array(all_labels), np.array(all_preds)
 
+def compute_class_level_accuracy(y_true, y_pred, class_names):
+    cm = confusion_matrix(y_true, y_pred, labels=list(range(len(class_names))))
+    total = cm.sum()
+
+    class_acc = {}
+    for i, name in enumerate(class_names):
+        tp = cm[i, i]
+        fn = cm[i, :].sum() - tp
+        fp = cm[:, i].sum() - tp
+        tn = total - tp - fn - fp
+
+        acc_i = (tp + tn) / total if total > 0 else 0.0
+        class_acc[name] = acc_i
+
+    overall_acc = np.trace(cm) / total if total > 0 else 0.0
+    return overall_acc, class_acc, cm
 
 def save_checkpoint(model, configs, hparams, epoch, best_f1, save_path):
     save_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "configs": vars(configs),
-            "hparams": hparams,
-            "model": copy.deepcopy(model.state_dict()),
-            "epoch": int(epoch),
-            "best_f1": float(best_f1),
-            "class_names": FULL_LABEL_MAP,
-            "expected_signal_length": int(X_SIGNAL_LENGTH),
-        },
-        save_path,
-    )   
 
+    checkpoint = {
+        "configs": vars(configs),
+        "hparams": hparams,
+        "model": copy.deepcopy(model.state_dict()),
+        "epoch": int(epoch),
+        "best_f1": float(best_f1),
+        "class_names": FULL_LABEL_MAP,
+        "expected_signal_length": int(X_SIGNAL_LENGTH),
+    }
+
+    torch.save(checkpoint, save_path)
+    print(f"Updated best checkpoint: {save_path}")
+
+def backup_best_checkpoint(save_path):
+    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    backup_path = save_path.parent / f"checkpoint_best_4class_{timestamp}.pt"
+    shutil.copy2(save_path, backup_path)
+    print(f"Saved backup checkpoint: {backup_path}")
 
 def main():
     set_seed(RANDOM_SEED)
@@ -304,13 +328,13 @@ def main():
 
         print("=== Stage 1: train classifier head ===")
         for epoch in range(1, NUM_EPOCHS_STAGE1 + 1):
-            train_loss, train_f1 = train_one_epoch(model, train_loader, optimizer, criterion, device)
-            val_loss, val_f1, _, _ = evaluate(model, val_loader, criterion, device)
+            train_loss, train_acc, train_f1 = train_one_epoch(model, train_loader, optimizer, criterion, device)
+            val_loss, val_acc, val_f1, _, _ = evaluate(model, val_loader, criterion, device)
 
             print(
                 f"[Stage1][Epoch {epoch}/{NUM_EPOCHS_STAGE1}] "
-                f"train_loss={train_loss:.4f} train_f1={train_f1:.4f} "
-                f"val_loss={val_loss:.4f} val_f1={val_f1:.4f}"
+                f"train_loss={train_loss:.4f} train_acc={train_acc:.4f} train_f1={train_f1:.4f} "
+                f"val_loss={val_loss:.4f} val_acc={val_acc:.4f} val_f1={val_f1:.4f}"
             )
 
             if val_f1 > best_f1:
@@ -336,13 +360,13 @@ def main():
     print(f"=== Stage 2: {stage2_title} ===")
 
     for epoch in range(1, NUM_EPOCHS_STAGE2 + 1):
-        train_loss, train_f1 = train_one_epoch(model, train_loader, optimizer, criterion, device)
-        val_loss, val_f1, _, _ = evaluate(model, val_loader, criterion, device)
+        train_loss, train_acc, train_f1 = train_one_epoch(model, train_loader, optimizer, criterion, device)
+        val_loss, val_acc, val_f1, _, _ = evaluate(model, val_loader, criterion, device)
 
         print(
             f"[Stage2][Epoch {epoch}/{NUM_EPOCHS_STAGE2}] "
-            f"train_loss={train_loss:.4f} train_f1={train_f1:.4f} "
-            f"val_loss={val_loss:.4f} val_f1={val_f1:.4f}"
+            f"train_loss={train_loss:.4f} train_acc={train_acc:.4f} train_f1={train_f1:.4f} "
+            f"val_loss={val_loss:.4f} val_acc={val_acc:.4f} val_f1={val_f1:.4f}"
         )
 
         save_epoch = NUM_EPOCHS_STAGE1 + epoch if USE_PRETRAINED_5CLASS else epoch
@@ -353,25 +377,34 @@ def main():
 
     print(f"\nBest validation macro-F1: {best_f1:.4f}")
     print(f"Saved checkpoint: {SAVE_PATH}")
+    backup_best_checkpoint(SAVE_PATH)
 
     ckpt = torch.load(SAVE_PATH, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model"])
 
-    test_loss, test_f1, y_true, y_pred = evaluate(model, test_loader, criterion, device)
+    test_loss, test_acc, test_f1, y_true, y_pred = evaluate(model, test_loader, criterion, device)
+    class_names = [IDX_TO_LABEL[i] for i in range(4)]
+    overall_acc, class_acc, cm = compute_class_level_accuracy(y_true, y_pred, class_names)
+
 
     print("\n=== TEST RESULTS ===")
     print("test_loss:", test_loss)
+    print("test_accuracy:", test_acc)
     print("test_macro_f1:", test_f1)
 
+    print("\n--- Class-level Accuracy (one-vs-rest) ---")
+    for name, acc in class_acc.items():
+        print(f"{name}: {acc:.4f}")
+
     print("\n--- Confusion Matrix ---")
-    print(confusion_matrix(y_true, y_pred, labels=[0, 1, 2, 3]))
+    print(cm)
 
     print("\n--- Classification Report ---")
     print(classification_report(
         y_true,
         y_pred,
         labels=[0, 1, 2, 3],
-        target_names=[IDX_TO_LABEL[i] for i in range(4)],
+        target_names=class_names,
         zero_division=0,
     ))
 

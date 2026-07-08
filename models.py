@@ -1,7 +1,6 @@
 import torch
 from torch import nn
 
-
 class ecgTransForm(nn.Module):
     def __init__(self, configs, hparams):
         super(ecgTransForm, self).__init__()
@@ -66,7 +65,6 @@ class ecgTransForm(nn.Module):
             nn.MaxPool1d(kernel_size=2, stride=2, padding=1),
         )
 
-        # Giữ 128 để khớp checkpoint 5 lớp cũ nếu bạn fine-tune từ checkpoint đó
         self.inplanes = 128
         self.crm = self._make_layer(SEBasicBlock, 128, 3)
 
@@ -83,7 +81,7 @@ class ecgTransForm(nn.Module):
         self.aap = nn.AdaptiveAvgPool1d(1)
         self.clf = nn.Linear(hparams["feature_dim"], configs.num_classes)
 
-    def _make_layer(self, block, planes, blocks, stride=1):
+    def _make_layer(self, block, planes, blocks, stride=1):  # makes residual SE block
         downsample = None
         if stride != 1 or self.inplanes != planes * block.expansion:
             downsample = nn.Sequential(
@@ -107,6 +105,7 @@ class ecgTransForm(nn.Module):
         return nn.Sequential(*layers)
 
     def forward(self, x_in):
+        # Multi-scale Convolutions
         x1 = self.conv1(x_in)
         x2 = self.conv2(x_in)
         x3 = self.conv3(x_in)
@@ -117,9 +116,10 @@ class ecgTransForm(nn.Module):
         x = self.conv_block2(x_concat)
         x = self.conv_block3(x)
 
+        # Channel Recalibration Module
         x = self.crm(x)
 
-        # Giữ nguyên như ECGTransForm gốc để tương thích checkpoint cũ
+        # Bi-directional Transformer
         x1 = self.transformer_encoder(x)
         x2 = self.transformer_encoder(torch.flip(x, [2]))
         x = x1 + x2
@@ -173,7 +173,7 @@ class SEBasicBlock(nn.Module):
         self.se = SELayer(planes, reduction)
         self.downsample = downsample
         self.stride = stride
-
+        
     def forward(self, x):
         residual = x
 

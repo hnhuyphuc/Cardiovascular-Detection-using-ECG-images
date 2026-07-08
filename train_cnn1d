@@ -1,0 +1,403 @@
+from pathlib import Path
+from types import SimpleNamespace
+import copy
+import random
+
+from matplotlib import cm
+import numpy as np
+import pandas as pd
+import torch
+from torch import nn
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, confusion_matrix, f1_score, accuracy_score
+
+from model_cnn1d import CNN1D
+from datetime import datetime
+
+
+BASE_DIR = Path(__file__).resolve().parent
+
+FINAL_1D_PATH = BASE_DIR / "Final_Dataset" / "Without_dimensionality_reduction" / "final_1D.csv"
+PCA_FINAL_PATH = BASE_DIR / "Final_Dataset" / "With_dimensionality_reduction" / "pca_final.csv"
+
+# checkpoint 5 lớp cũ để fine-tune backbone
+USE_PRETRAINED_5CLASS = False
+PRETRAINED_5CLASS_CKPT = BASE_DIR / "checkpoint_best.pt"
+
+# lưu thẳng vào Deployment để web dùng luôn
+SAVE_PATH = BASE_DIR / "Deployment" / "checkpoint_best_cnn1d_4class.pt"
+
+BATCH_SIZE = 32
+NUM_EPOCHS_STAGE1 = 10
+NUM_EPOCHS_STAGE2 = 50
+LR_STAGE1 = 1e-3
+LR_STAGE2 = 1e-3
+WEIGHT_DECAY = 1e-4
+RANDOM_SEED = 42
+X_SIGNAL_LENGTH = 3060  # khớp pipeline cũ: 12 leads x 255 points
+
+# mapping đúng theo data train
+IDX_TO_LABEL = {
+    0: "AHB",
+    1: "MI",
+    2: "NORMAL",
+    3: "PM",
+}
+
+FULL_LABEL_MAP = {
+    0: "AHB - Abnormal Heartbeat",
+    1: "MI - Myocardial Infarction",
+    2: "NORMAL - Normal",
+    3: "PM - History of MI",
+}
+
+
+def set_seed(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def load_data():
+    if not FINAL_1D_PATH.exists():
+        raise FileNotFoundError(f"Không tìm thấy: {FINAL_1D_PATH}")
+    if not PCA_FINAL_PATH.exists():
+        raise FileNotFoundError(f"Không tìm thấy: {PCA_FINAL_PATH}")
+
+    # final_1D là input 1D gốc
+    X_df = pd.read_csv(FINAL_1D_PATH, header=None)
+
+    # pca_final có cột cuối là target
+    y_df = pd.read_csv(PCA_FINAL_PATH)
+    y_df = y_df.drop(columns=["Unnamed: 0"], errors="ignore")
+    y = y_df.iloc[:, -1]
+
+    X = X_df.values.astype(np.float32)
+    y = y.values.astype(np.int64)
+
+    if len(X) != len(y):
+        raise ValueError(f"Số dòng X và y không khớp: {len(X)} vs {len(y)}")
+    
+    if X.shape[1] != X_SIGNAL_LENGTH:
+        raise ValueError(
+            f"Độ dài input train không đúng. Expected={X_SIGNAL_LENGTH}, got={X.shape[1]}"
+        )
+
+    print("X shape:", X.shape)
+    print("y shape:", y.shape)
+    print("unique labels:", np.unique(y))
+    print("label counts:", {int(k): int(v) for k, v in zip(*np.unique(y, return_counts=True))})
+    print("label map:", FULL_LABEL_MAP)
+
+    return X, y
+
+
+class ECG1DDataset(Dataset):
+    def __init__(self, signals: np.ndarray, labels: np.ndarray):
+        self.signals = signals.astype(np.float32)
+        self.labels = labels.astype(np.int64)
+
+    def __len__(self):
+        return len(self.signals)
+
+    def __getitem__(self, idx):
+        x = self.signals[idx]
+
+        # ép về [1, L]
+        if x.ndim == 1:
+            x = np.expand_dims(x, axis=0)
+        elif x.ndim == 2:
+            if x.shape[0] == 1:
+                pass
+            elif x.shape[1] == 1:
+                x = x.T
+            else:
+                raise ValueError(f"Unexpected sample shape: {x.shape}")
+        else:
+            raise ValueError(f"Unexpected ndim: {x.ndim}, shape: {x.shape}")
+
+        y = self.labels[idx]
+        return torch.tensor(x, dtype=torch.float32), torch.tensor(y, dtype=torch.long)
+
+
+def build_configs_and_hparams():
+    configs = SimpleNamespace(
+        input_channels=1,
+        mid_channels=32,
+        stride=1,
+        dropout=0.2,
+        final_out_channels=128,
+        trans_dim=385,
+        num_heads=5,
+        num_classes=4,
+    )
+
+    hparams = {
+        "feature_dim": 128
+    }
+
+    return configs, hparams
+
+
+def load_pretrained_5class_weights(model, ckpt_path, device):
+    if not ckpt_path.exists():
+        raise FileNotFoundError(f"Không tìm thấy checkpoint 5 lớp: {ckpt_path}")
+
+    ckpt = torch.load(ckpt_path, map_location=device)
+    state_dict = ckpt["model"] if "model" in ckpt else ckpt
+
+    # bỏ head 5 lớp cũ
+    filtered_state = {
+        k: v for k, v in state_dict.items()
+        if k not in ["clf.weight", "clf.bias"]
+    }
+
+    missing, unexpected = model.load_state_dict(filtered_state, strict=False)
+    print("Loaded pretrained 5-class checkpoint.")
+    print("Missing keys:", missing)
+    print("Unexpected keys:", unexpected)
+    return model
+
+
+def compute_class_weights(y_train: np.ndarray, num_classes: int):
+    counts = np.bincount(y_train, minlength=num_classes).astype(np.float32)
+    counts[counts == 0] = 1.0
+    weights = counts.sum() / (num_classes * counts)
+    return torch.tensor(weights, dtype=torch.float32)
+
+
+def train_one_epoch(model, loader, optimizer, criterion, device):
+    model.train()
+    total_loss = 0.0
+    total_count = 0
+
+    all_preds = []
+    all_labels = []
+
+    for x, y in loader:
+        x = x.to(device)
+        y = y.to(device)
+
+        optimizer.zero_grad()
+        logits = model(x)
+        loss = criterion(logits, y)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+
+        total_loss += loss.item() * x.size(0)
+        total_count += x.size(0)
+
+        preds = torch.argmax(logits, dim=1)
+        all_preds.extend(preds.detach().cpu().numpy().tolist())
+        all_labels.extend(y.detach().cpu().numpy().tolist())
+
+    avg_loss = total_loss / max(total_count, 1)
+    macro_f1 = f1_score(all_labels, all_preds, average="macro")
+    return avg_loss, macro_f1
+
+
+@torch.no_grad()
+def evaluate(model, loader, criterion, device):
+    model.eval()
+    total_loss = 0.0
+    total_count = 0
+
+    all_preds = []
+    all_labels = []
+
+    for x, y in loader:
+        x = x.to(device)
+        y = y.to(device)
+
+        logits = model(x)
+        loss = criterion(logits, y)
+
+        total_loss += loss.item() * x.size(0)
+        total_count += x.size(0)
+
+        preds = torch.argmax(logits, dim=1)
+        all_preds.extend(preds.detach().cpu().numpy().tolist())
+        all_labels.extend(y.detach().cpu().numpy().tolist())
+
+    avg_loss = total_loss / max(total_count, 1)
+    macro_f1 = f1_score(all_labels, all_preds, average="macro")
+
+    return avg_loss, macro_f1, np.array(all_labels), np.array(all_preds)
+
+def compute_class_level_accuracy(y_true, y_pred, class_names):
+    cm = confusion_matrix(y_true, y_pred, labels=list(range(len(class_names))))
+    total = cm.sum()
+
+    print("\n--- Class-level Accuracy (one-vs-rest) ---")
+    for i, name in enumerate(class_names):
+        tp = cm[i, i]
+        fn = cm[i, :].sum() - tp
+        fp = cm[:, i].sum() - tp
+        tn = total - tp - fn - fp
+        acc_i = (tp + tn) / total if total > 0 else 0.0
+        print(f"{name}: {acc_i:.4f}")
+
+    return cm
+
+def save_checkpoint(model, epoch, best_f1, save_path):
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "model": copy.deepcopy(model.state_dict()),
+            "epoch": int(epoch),
+            "best_f1": float(best_f1),
+            "model_name": "CNN1D",
+            "num_classes": 4,
+            "expected_signal_length": int(X_SIGNAL_LENGTH),
+        },
+        save_path,
+    )  
+
+
+def main():
+    set_seed(RANDOM_SEED)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("device:", device)
+
+    X, y = load_data()
+
+    X_train, X_temp, y_train, y_temp = train_test_split(
+        X, y, test_size=0.30, random_state=RANDOM_SEED, stratify=y
+    )
+    X_val, X_test, y_val, y_test = train_test_split(
+        X_temp, y_temp, test_size=0.50, random_state=RANDOM_SEED, stratify=y_temp
+    )
+
+    print("X_train:", X_train.shape, "y_train:", y_train.shape)
+    print("X_val  :", X_val.shape, "y_val  :", y_val.shape)
+    print("X_test :", X_test.shape, "y_test :", y_test.shape)
+
+    train_ds = ECG1DDataset(X_train, y_train)
+    val_ds = ECG1DDataset(X_val, y_val)
+    test_ds = ECG1DDataset(X_test, y_test)
+
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+    test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+
+    model = CNN1D(num_classes=4).to(device)
+
+    if USE_PRETRAINED_5CLASS:
+        print("Using pretrained checkpoint:", PRETRAINED_5CLASS_CKPT)
+        model = load_pretrained_5class_weights(model, PRETRAINED_5CLASS_CKPT, device)
+
+    class_weights = compute_class_weights(y_train, num_classes=4).to(device)
+    print("class_weights:", class_weights)
+
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
+    best_f1 = -1.0
+
+    # =========================================================
+    # Stage 1: chỉ chạy khi CÓ pretrained
+    # =========================================================
+    if USE_PRETRAINED_5CLASS:
+        for name, param in model.named_parameters():
+            if name.startswith("clf"):
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
+
+        optimizer = torch.optim.Adam(
+            filter(lambda p: p.requires_grad, model.parameters()),
+            lr=LR_STAGE1,
+            weight_decay=WEIGHT_DECAY,
+            betas=(0.9, 0.99),
+        )
+
+        print("=== Stage 1: train classifier head ===")
+        for epoch in range(1, NUM_EPOCHS_STAGE1 + 1):
+            train_loss, train_f1 = train_one_epoch(model, train_loader, optimizer, criterion, device)
+            val_loss, val_f1, _, _ = evaluate(model, val_loader, criterion, device)
+
+            print(
+                f"[Stage1][Epoch {epoch}/{NUM_EPOCHS_STAGE1}] "
+                f"train_loss={train_loss:.4f} train_f1={train_f1:.4f} "
+                f"val_loss={val_loss:.4f} val_f1={val_f1:.4f}"
+            )
+
+            if val_f1 > best_f1:
+                best_f1 = val_f1
+                save_checkpoint(model, save_epoch, best_f1, SAVE_PATH)
+
+    # =========================================================
+    # Stage 2: full model training / fine-tuning
+    # - nếu có pretrained: đây là fine-tune full model
+    # - nếu không pretrained: đây là train full model từ đầu
+    # =========================================================
+    for param in model.parameters():
+        param.requires_grad = True
+
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=LR_STAGE2,
+        weight_decay=WEIGHT_DECAY,
+        betas=(0.9, 0.99),
+    )
+
+    stage2_title = "fine-tune full model" if USE_PRETRAINED_5CLASS else "train full model from scratch"
+    print(f"=== Stage 2: {stage2_title} ===")
+
+    for epoch in range(1, NUM_EPOCHS_STAGE2 + 1):
+        train_loss, train_f1 = train_one_epoch(model, train_loader, optimizer, criterion, device)
+        val_loss, val_f1, _, _ = evaluate(model, val_loader, criterion, device)
+
+        print(
+            f"[Stage2][Epoch {epoch}/{NUM_EPOCHS_STAGE2}] "
+            f"train_loss={train_loss:.4f} train_f1={train_f1:.4f} "
+            f"val_loss={val_loss:.4f} val_f1={val_f1:.4f}"
+        )
+
+        save_epoch = NUM_EPOCHS_STAGE1 + epoch if USE_PRETRAINED_5CLASS else epoch
+
+        if val_f1 > best_f1:
+            best_f1 = val_f1
+            save_checkpoint(model, save_epoch, best_f1, SAVE_PATH)
+
+    print(f"\nBest validation macro-F1: {best_f1:.4f}")
+    print(f"Saved checkpoint: {SAVE_PATH}")
+
+    ckpt = torch.load(SAVE_PATH, map_location=device, weights_only=False)
+    model.load_state_dict(ckpt["model"])
+
+    test_loss, test_f1, y_true, y_pred = evaluate(model, test_loader, criterion, device)
+
+    print("\n=== TEST RESULTS ===")
+    print("test_loss:", test_loss)
+    print("test_macro_f1:", test_f1)
+
+    print("\n--- Confusion Matrix ---")
+    print(confusion_matrix(y_true, y_pred, labels=[0, 1, 2, 3]))
+
+    class_names = [IDX_TO_LABEL[i] for i in range(4)]
+
+    cm = compute_class_level_accuracy(y_true, y_pred, class_names)
+
+    print("\n--- Confusion Matrix ---")
+    print(cm)
+
+    print("\n--- Classification Report ---")
+    print(classification_report(
+        y_true,
+        y_pred,
+        labels=[0, 1, 2, 3],
+        target_names=class_names,
+        zero_division=0,
+    ))
+
+    test_acc = accuracy_score(y_true, y_pred)
+    print("test_accuracy:", test_acc)
+
+
+if __name__ == "__main__":
+    main()
